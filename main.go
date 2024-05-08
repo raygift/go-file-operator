@@ -8,6 +8,7 @@ import (
 	"log"
 	"os"
 	"path"
+	"strconv"
 	"time"
 
 	"github.com/spf13/cobra"
@@ -17,6 +18,7 @@ var (
 	filepath string
 	duration int64
 	interval int64
+	maxSize  int64 // 文件大小上限，单位MB，日志文件达到上限后会被归档，需要重置offset 并打开新文件
 	errCh    chan error
 )
 
@@ -27,13 +29,16 @@ func main() {
 		Version: "Scanner version", // cobra设置--version的固定写法
 		Run: func(cmd *cobra.Command, args []string) {
 			var fileOffset int64 = 0
-			LoopReadFile(filepath, &fileOffset, duration, interval)
+			var fileCount int64 = 0
+			LoopReadFile(filepath, &fileOffset, &fileCount, duration, interval)
 		},
 	}
 
 	rootCmd.Flags().StringVarP(&filepath, "filepath", "F", "", "")
 	rootCmd.Flags().Int64VarP(&duration, "File Read Duration", "D", 0, "")
 	rootCmd.Flags().Int64VarP(&interval, "File Read Interval", "I", 10, "")
+	rootCmd.Flags().Int64VarP(&maxSize, "Max Size Per File", "M", 1, "")
+
 	_ = rootCmd.MarkFlagRequired("filepath")
 
 	if err := rootCmd.Execute(); err != nil {
@@ -46,13 +51,13 @@ func main() {
 // interval 尝试读取文件内容的间隔，单位: 秒（s)
 // offset 读取文件的偏移量
 // file 要读取的目标文件名
-func LoopReadFile(file string, offset *int64, duration, interval int64) error {
+func LoopReadFile(file string, offset, fileCount *int64, duration, interval int64) error {
 	it := time.NewTicker(time.Duration(interval) * time.Second)
 	//
 	ctx, cancel := context.WithTimeout(context.Background(), time.Duration(duration)*time.Second)
 	defer cancel()
 	for {
-		ReadFileContent(file, offset)
+		ReadFileContent(file, offset, fileCount)
 		select {
 		case <-ctx.Done():
 			//到达持续时间，退出读取
@@ -79,7 +84,7 @@ func LoopReadFile(file string, offset *int64, duration, interval int64) error {
 	// return string(data), err
 }
 
-func ReadFileContent(file string, offset *int64) {
+func ReadFileContent(file string, offset, fileCount *int64) {
 	fmt.Println("ReadFileContent offset: ", *offset) // end：读取文件之后的偏移量
 
 	f, err := os.OpenFile(file, os.O_RDWR, os.ModePerm)
@@ -115,20 +120,35 @@ func ReadFileContent(file string, offset *int64) {
 		log.Fatal(err)
 		errCh <- err
 	}
-	// 更新最新的偏移量
+
+	// 若读取位置与 offset 相同，说明本次未读取到新内容
+	// 本次读取结束
 	if *offset == end {
 		fmt.Println("no new line in file")
+		// 已读取到的文件内容大于文件大小上限
+		if *offset >= maxSize*1024*1024 {
+			// 当前文件将被归档
+			// 重置 offset
+			*offset = 0
+			*fileCount += 1
+			fmt.Println("reset offset")
+		}
+		// 退出本次读取
 		return
 	}
+
+	// 否则本地读取到了内容
+	// 下面处理本次读取到的内容
 	fmt.Printf("read file size(%d)bytes, cost(%d)ms, update offset:%d\n", len(bytes), finish/1e6, *offset)
 
+	// 更新最新的偏移量
 	*offset = end
 	// fmt.Println("update offset: ", *offset) // end：读取文件之后的偏移量
 
 	// 将读取到的内容写入结果文件
 	fileName := path.Base(file)
 	pathName := file[0 : len(file)-len(fileName)]
-	resultFile := pathName + "result_" + fileName
+	resultFile := pathName + "result_" + strconv.Itoa(int(*fileCount)) + "_" + fileName
 	rf, err := os.OpenFile(resultFile, os.O_WRONLY|os.O_CREATE|os.O_APPEND, os.ModePerm)
 	if err != nil {
 		log.Fatal(err)
